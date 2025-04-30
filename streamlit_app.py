@@ -1,5 +1,8 @@
 import streamlit as st
 import snowflake.snowpark as sp
+from snowflake.snowpark.functions import col
+cnx=st.connection("snowflake")
+session = cnx.session()
 from snowflake.snowpark import Session
 from datetime import datetime, timedelta
 import re
