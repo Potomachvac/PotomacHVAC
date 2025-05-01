@@ -15,6 +15,8 @@ import io
 from PIL import Image, ImageOps
 import io
 
+
+
 def crop_to_square(image_bytes):
     img = Image.open(io.BytesIO(image_bytes))
     return ImageOps.fit(img, (120, 120))  # Crop to square
@@ -168,61 +170,196 @@ def reset_password(token):
 def home():
     session = get_session()
     
-    # Welcome section with picture
-    col_welcome, col_picture = st.columns([4, 1])
-    with col_welcome:
-        st.subheader("Home")
-        st.write(f"Welcome, **{st.session_state.user_name}**!")
-        st.write(f"**Role:** {', '.join(st.session_state.roles)}")
+    # Initialize all variables
+    selected_date = datetime.now().date()
+    manual_time = False
+    manual_clock_in = None
+    manual_clock_out = None
+    manual_break_start = None
+    manual_break_end = None
+    is_clocked_in = False
+    is_on_break = False
+    time_entry = []
+    break_entry = []
+
+    # --- UI Layout ---
+    st.title("Employee Time Tracking")
     
-    with col_picture:    
-        picture_info = session.sql(f"""
-            SELECT PICTURE_DATA_TEXT FROM EMPLOYEE_PICTURES
+    # Header with profile
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.subheader(f"Welcome, {st.session_state.user_name}!")
+        st.caption(f"Role: {', '.join(st.session_state.roles)}")
+    
+    with col2:
+        # Profile picture display
+        try:
+            pic_data = session.sql(f"""
+                SELECT PICTURE_DATA_TEXT FROM EMPLOYEE_PICTURES
+                WHERE EMPLOYEEID = '{st.session_state.user_id}'
+                ORDER BY UPLOADED_AT DESC LIMIT 1
+            """).collect()
+            
+            if pic_data and pic_data[0]['PICTURE_DATA_TEXT']:
+                img = Image.open(io.BytesIO(base64.b64decode(pic_data[0]['PICTURE_DATA_TEXT'])))
+                st.image(img, width=100, caption="Your Profile")
+            else:
+                st.image(Image.new('RGB', (100, 100), color='gray'), width=100)
+        except Exception as e:
+            st.error(f"Couldn't load profile picture: {str(e)}")
+
+    # --- Date Selection ---
+    selected_date = st.date_input("Select Date", value=selected_date)
+    
+    # --- Time Tracking Section ---
+    st.subheader("Time Tracking")
+    manual_time = st.toggle("Manual Time Entry", help="Enable to enter times manually")
+    
+    if manual_time:
+        with st.form("manual_time_form"):
+            st.warning("Manual Entry Mode - For correcting missed punches")
+            
+            cols = st.columns(2)
+            with cols[0]:
+                manual_clock_in = st.time_input("Clock In Time", value=None)
+            with cols[1]:
+                manual_clock_out = st.time_input("Clock Out Time", value=None)
+            
+            cols = st.columns(2)
+            with cols[0]:
+                manual_break_start = st.time_input("Break Start", value=None)
+            with cols[1]:
+                manual_break_end = st.time_input("Break End", value=None)
+            
+            if st.form_submit_button("Save Manual Entry"):
+                # Validate required fields
+                if not manual_clock_in:
+                    st.error("Clock in time is required")
+                else:
+                    try:
+                        # Convert to datetime objects
+                        clock_in_dt = datetime.combine(selected_date, manual_clock_in)
+                        clock_out_dt = datetime.combine(selected_date, manual_clock_out) if manual_clock_out else None
+                        
+                        # Check for existing entry
+                        existing = session.sql(f"""
+                            SELECT ENTRYID FROM employee_time_entries
+                            WHERE EMPLOYEEID = '{st.session_state.user_id}'
+                            AND ENTRY_DATE = '{selected_date}'
+                            LIMIT 1
+                        """).collect()
+                        
+                        if existing:
+                            # Update existing entry
+                            session.sql(f"""
+                                UPDATE employee_time_entries
+                                SET CLOCK_IN = '{clock_in_dt}',
+                                    CLOCK_OUT = {'NULL' if clock_out_dt is None else f"'{clock_out_dt}'"}
+                                WHERE ENTRYID = '{existing[0]['ENTRYID']}'
+                            """).collect()
+                        else:
+                            # Create new entry
+                            entry_id = f"ENTRY{datetime.now().timestamp()}"
+                            session.sql(f"""
+                                INSERT INTO employee_time_entries
+                                (ENTRYID, EMPLOYEEID, CLOCK_IN, CLOCK_OUT, ENTRY_DATE)
+                                VALUES (
+                                    '{entry_id}',
+                                    '{st.session_state.user_id}',
+                                    '{clock_in_dt}',
+                                    {'NULL' if clock_out_dt is None else f"'{clock_out_dt}'"},
+                                    '{selected_date}'
+                                )
+                            """).collect()
+                        
+                        st.success("Time entry saved successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error saving time entry: {str(e)}")
+    
+    else:  # Automatic time tracking
+        # Get current status
+        time_entry = session.sql(f"""
+            SELECT * FROM employee_time_entries
             WHERE EMPLOYEEID = '{st.session_state.user_id}'
-            ORDER BY UPLOADED_AT DESC
+            AND ENTRY_DATE = '{selected_date}'
+            ORDER BY CLOCK_IN DESC
             LIMIT 1
         """).collect()
         
-        if picture_info and picture_info[0]['PICTURE_DATA_TEXT']:
-            try:
-                image_data = base64.b64decode(picture_info[0]['PICTURE_DATA_TEXT'])
-                processed_img = process_image(image_data, 120)
-                st.image(processed_img, width=120, caption="Your profile")
-            except Exception as e:
-                st.error(f"Couldn't load picture: {str(e)}")
-        else:
-            st.info("No picture")
-
-    # Date selection for time entries
-    selected_date = st.date_input("Select Date", datetime.now().date())
-    
-    # Manual time entry option
-    manual_time = st.checkbox("Enter times manually", key="manual_time_entry")
-    
-    # Initialize time variables
-    clock_in_time = None
-    clock_out_time = None
-    break_in_time = None
-    break_end_time = None
-
-    # Time entry fields (shown only if manual_time is True)
-    if manual_time:
-        col1, col2 = st.columns(2)
-        with col1:
-            clock_in_time = st.time_input("Clock In Time", key="manual_clock_in")
-        with col2:
-            clock_out_time = st.time_input("Clock Out Time", key="manual_clock_out", 
-                                         disabled=(not clock_in_time))
+        break_entry = session.sql(f"""
+            SELECT * FROM employee_break_entries
+            WHERE EMPLOYEEID = '{st.session_state.user_id}'
+            AND ENTRY_DATE = '{selected_date}'
+            ORDER BY BREAK_START DESC
+            LIMIT 1
+        """).collect()
         
-        col3, col4 = st.columns(2)
-        with col3:
-            break_in_time = st.time_input("Break Start Time", key="manual_break_in",
-                                        disabled=(not clock_in_time))
-        with col4:
-            break_end_time = st.time_input("Break End Time", key="manual_break_end",
-                                         disabled=(not break_in_time))
+        is_clocked_in = len(time_entry) > 0 and time_entry[0]['CLOCK_OUT'] is None
+        is_on_break = len(break_entry) > 0 and break_entry[0]['BREAK_END'] is None
+        
+        # Time tracking buttons
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("🟢 Clock In", disabled=is_clocked_in,
+                        help="Cannot clock in if already clocked in"):
+                session.sql(f"""
+                    INSERT INTO employee_time_entries
+                    (ENTRYID, EMPLOYEEID, CLOCK_IN, ENTRY_DATE)
+                    VALUES (
+                        'ENTRY{datetime.now().timestamp()}',
+                        '{st.session_state.user_id}',
+                        CURRENT_TIMESTAMP(),
+                        '{selected_date}'
+                    )
+                """).collect()
+                st.rerun()
+        
+        with cols[1]:
+            if st.button("🔴 Clock Out", disabled=not is_clocked_in or is_on_break,
+                        help="Cannot clock out while on break or if not clocked in"):
+                session.sql(f"""
+                    UPDATE employee_time_entries
+                    SET CLOCK_OUT = CURRENT_TIMESTAMP()
+                    WHERE EMPLOYEEID = '{st.session_state.user_id}'
+                    AND ENTRY_DATE = '{selected_date}'
+                    AND CLOCK_OUT IS NULL
+                """).collect()
+                st.rerun()
+        
+        # Break management buttons
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("🟡 Start Break", disabled=not is_clocked_in or is_on_break,
+                        help="Cannot start break if not clocked in or already on break"):
+                session.sql(f"""
+                    INSERT INTO employee_break_entries
+                    (BREAKID, EMPLOYEEID, BREAK_START, ENTRY_DATE)
+                    VALUES (
+                        'BREAK{datetime.now().timestamp()}',
+                        '{st.session_state.user_id}',
+                        CURRENT_TIMESTAMP(),
+                        '{selected_date}'
+                    )
+                """).collect()
+                st.rerun()
+        
+        with cols[1]:
+            if st.button("🟢 End Break", disabled=not is_on_break,
+                        help="Cannot end break if not currently on break"):
+                session.sql(f"""
+                    UPDATE employee_break_entries
+                    SET BREAK_END = CURRENT_TIMESTAMP()
+                    WHERE EMPLOYEEID = '{st.session_state.user_id}'
+                    AND ENTRY_DATE = '{selected_date}'
+                    AND BREAK_END IS NULL
+                """).collect()
+                st.rerun()
 
-    # Fetch time and break entries for selected date
+    # --- Current Status Display ---
+    st.subheader("Current Status")
+    
+    # Get latest status after potential updates
     time_entry = session.sql(f"""
         SELECT * FROM employee_time_entries
         WHERE EMPLOYEEID = '{st.session_state.user_id}'
@@ -230,7 +367,7 @@ def home():
         ORDER BY CLOCK_IN DESC
         LIMIT 1
     """).collect()
-
+    
     break_entry = session.sql(f"""
         SELECT * FROM employee_break_entries
         WHERE EMPLOYEEID = '{st.session_state.user_id}'
@@ -238,191 +375,41 @@ def home():
         ORDER BY BREAK_START DESC
         LIMIT 1
     """).collect()
-
-    # Determine current state
-    has_time_entry = time_entry and len(time_entry) > 0
-    has_break_entry = break_entry and len(break_entry) > 0
     
-    is_clocked_in = has_time_entry and not time_entry[0]['CLOCK_OUT']
-    is_on_break = has_break_entry and not break_entry[0]['BREAK_END']
-
-    # Time entry buttons with state management
-    st.subheader("Time Tracking")
-    
-    if manual_time:
-        if st.button("Save Manual Time Entry"):
-            # Validate time sequence
-            error = False
-            
-            # Convert to datetime objects for comparison
-            clock_in_dt = datetime.combine(selected_date, clock_in_time) if clock_in_time else None
-            clock_out_dt = datetime.combine(selected_date, clock_out_time) if clock_out_time else None
-            break_in_dt = datetime.combine(selected_date, break_in_time) if break_in_time else None
-            break_end_dt = datetime.combine(selected_date, break_end_time) if break_end_time else None
-            
-            if clock_out_time and clock_in_time and clock_out_time <= clock_in_time:
-                st.error("Clock out time must be after clock in time")
-                error = True
-            
-            if break_in_time:
-                if not clock_in_time:
-                    st.error("Break can only be recorded after clocking in")
-                    error = True
-                elif break_in_time <= clock_in_time:
-                    st.error("Break start must be after clock in time")
-                    error = True
-            
-            if break_end_time:
-                if not break_in_time:
-                    st.error("Break end can only be recorded after break start")
-                    error = True
-                elif break_end_time <= break_in_time:
-                    st.error("Break end must be after break start")
-                    error = True
-            
-            if clock_out_time and break_end_time and clock_out_time <= break_end_time:
-                st.error("Clock out must be after break end")
-                error = True
-            
-            if not error:
-                # Handle manual time entry
-                entry_id = f"ENTRY{datetime.now().timestamp()}"
-                session.sql(f"""
-                    INSERT INTO employee_time_entries
-                    (ENTRYID, EMPLOYEEID, CLOCK_IN, CLOCK_OUT, ENTRY_DATE)
-                    VALUES (
-                        '{entry_id}',
-                        '{st.session_state.user_id}',
-                        '{clock_in_dt}'{(', NULL' if not clock_out_time else f", '{clock_out_dt}'")},
-                        '{selected_date}'
-                    )
-                """).collect()
-                
-                if break_in_time:
-                    break_id = f"BREAK{datetime.now().timestamp()}"
-                    session.sql(f"""
-                        INSERT INTO employee_break_entries
-                        (BREAKID, EMPLOYEEID, BREAK_START, BREAK_END, ENTRY_DATE)
-                        VALUES (
-                            '{break_id}',
-                            '{st.session_state.user_id}',
-                            '{break_in_dt}'{(', NULL' if not break_end_time else f", '{break_end_dt}'")},
-                            '{selected_date}'
-                        )
-                    """).collect()
-                
-                st.success(f"Time entries saved for {selected_date}!")
-                st.rerun()
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            # Clock In button - only enabled if not currently clocked in for selected date
-            if st.button("Clock In", 
-                        key=f"clock_in_{selected_date}",
-                        disabled=is_clocked_in,
-                        help="Cannot clock in again if already clocked in for this date"):
-                entry_id = f"ENTRY{datetime.now().timestamp()}"
-                session.sql(f"""
-                    INSERT INTO employee_time_entries
-                    (ENTRYID, EMPLOYEEID, CLOCK_IN, ENTRY_DATE)
-                    VALUES (
-                        '{entry_id}',
-                        '{st.session_state.user_id}',
-                        CURRENT_TIMESTAMP(),
-                        '{selected_date}'
-                    )
-                """).collect()
-                st.success(f"Clocked in successfully for {selected_date}!")
-                st.rerun()
-        
-        with col2:
-            # Clock Out button - only enabled if clocked in and not on break
-            if st.button("Clock Out", 
-                        key=f"clock_out_{selected_date}",
-                        disabled=not is_clocked_in or is_on_break,
-                        help="Cannot clock out while on break or if not clocked in"):
-                if has_time_entry:
-                    session.sql(f"""
-                        UPDATE employee_time_entries
-                        SET CLOCK_OUT = CURRENT_TIMESTAMP()
-                        WHERE ENTRYID = '{time_entry[0]['ENTRYID']}'
-                    """).collect()
-                    st.success(f"Clocked out successfully for {selected_date}!")
-                    st.rerun()
-
-        # Break management buttons
-        col3, col4 = st.columns(2)
-        with col3:
-            # Break In button - only enabled if clocked in and not already on break
-            if st.button("Break In", 
-                        key=f"break_in_{selected_date}",
-                        disabled=not is_clocked_in or is_on_break,
-                        help="Cannot start break if not clocked in or already on break"):
-                break_id = f"BREAK{datetime.now().timestamp()}"
-                session.sql(f"""
-                    INSERT INTO employee_break_entries
-                    (BREAKID, EMPLOYEEID, BREAK_START, ENTRY_DATE)
-                    VALUES (
-                        '{break_id}',
-                        '{st.session_state.user_id}',
-                        CURRENT_TIMESTAMP(),
-                        '{selected_date}'
-                    )
-                """).collect()
-                st.success(f"Break started successfully for {selected_date}!")
-                st.rerun()
-        
-        with col4:
-            # Break Out button - only enabled if currently on break
-            if st.button("Break Out", 
-                        key=f"break_out_{selected_date}",
-                        disabled=not is_on_break,
-                        help="Cannot end break if not currently on break"):
-                if has_break_entry:
-                    session.sql(f"""
-                        UPDATE employee_break_entries
-                        SET BREAK_END = CURRENT_TIMESTAMP()
-                        WHERE BREAKID = '{break_entry[0]['BREAKID']}'
-                    """).collect()
-                    st.success(f"Break ended successfully for {selected_date}!")
-                    st.rerun()
-
-    # Current status display
-    st.subheader("Current Status")
-    status_col1, status_col2 = st.columns(2)
-    with status_col1:
+    cols = st.columns(2)
+    with cols[0]:
         # Clock status
-        if is_clocked_in and has_time_entry:
-            st.success("✅ Currently Clocked In")
-            st.write(f"**Clock In Time:** {time_entry[0]['CLOCK_IN']}")
-        elif has_time_entry and time_entry[0]['CLOCK_OUT']:
-            st.info("🕒 Clocked Out")
-            st.write(f"**Clock In Time:** {time_entry[0]['CLOCK_IN']}")
-            st.write(f"**Clock Out Time:** {time_entry[0]['CLOCK_OUT']}")
+        if time_entry:
+            if time_entry[0]['CLOCK_OUT'] is None:
+                st.success("🟢 Currently Clocked In")
+                st.write(f"**Since:** {time_entry[0]['CLOCK_IN'].strftime('%I:%M %p')}")
+            else:
+                st.info("🔴 Clocked Out")
+                st.write(f"**Worked:** {time_entry[0]['CLOCK_IN'].strftime('%I:%M %p')} to {time_entry[0]['CLOCK_OUT'].strftime('%I:%M %p')}")
         else:
-            st.warning("⏱ Not Clocked In")
+            st.warning("⚪ Not Clocked In Today")
         
         # Break status
-        if is_on_break and has_break_entry:
-            st.error("⏸ Currently On Break")
-            st.write(f"**Break Start Time:** {break_entry[0]['BREAK_START']}")
-        elif has_break_entry and break_entry[0]['BREAK_END']:
-            st.info("☑️ Break Completed")
-            st.write(f"**Break Time:** {break_entry[0]['BREAK_START']} to {break_entry[0]['BREAK_END']}")
-        elif is_clocked_in:
+        if break_entry:
+            if break_entry[0]['BREAK_END'] is None:
+                st.error("🟡 Currently On Break")
+                st.write(f"**Since:** {break_entry[0]['BREAK_START'].strftime('%I:%M %p')}")
+            else:
+                st.info("☑️ Break Completed")
+                st.write(f"**Break:** {break_entry[0]['BREAK_START'].strftime('%I:%M %p')} to {break_entry[0]['BREAK_END'].strftime('%I:%M %p')}")
+        elif time_entry and time_entry[0]['CLOCK_OUT'] is None:
             st.success("✅ Available for Break")
-        else:
-            st.info("ℹ️ Break not available (not clocked in)")
     
-    with status_col2:
-        # Calculate and display hours
-        if has_time_entry:
-            if time_entry[0]['CLOCK_OUT']:
-                clock_in = time_entry[0]['CLOCK_IN']
-                clock_out = time_entry[0]['CLOCK_OUT']
+    with cols[1]:
+        # Hours calculation
+        if time_entry and time_entry[0]['CLOCK_IN']:
+            clock_in = time_entry[0]['CLOCK_IN']
+            clock_out = time_entry[0]['CLOCK_OUT'] if time_entry[0]['CLOCK_OUT'] else datetime.now()
+            
+            if clock_out:
                 total_hours = (clock_out - clock_in).total_seconds() / 3600
                 
-                if has_break_entry and break_entry[0]['BREAK_END']:
+                if break_entry and break_entry[0]['BREAK_START'] and break_entry[0]['BREAK_END']:
                     break_start = break_entry[0]['BREAK_START']
                     break_end = break_entry[0]['BREAK_END']
                     break_hours = (break_end - break_start).total_seconds() / 3600
@@ -432,23 +419,46 @@ def home():
                     st.metric("Break Time", f"{break_hours:.2f}")
                     st.metric("Net Hours", f"{net_hours:.2f}")
                 else:
-                    st.metric("Total Hours", f"{total_hours:.2f}")
+                    st.metric("Hours Worked", f"{total_hours:.2f}")
             else:
-                st.info("⏳ Currently working - clock out to see total hours")
+                st.info("⏳ Currently working...")
         else:
             st.info("No time entries for selected date")
 
-    # Rest of your existing code for appointments and work summary...
-    # [Keep the existing appointments and work summary sections from your original code]
+    # --- Appointments Section ---
+    # [Keep your existing appointments code]
+    
+    # --- Work Summary Section ---
+    # [Keep your existing work summary code]
+
+
+
+
+
+
+
 
     
 
-              
+    
+
+
+
         
+ 
 
-    
-   
-    # Appointments section
+
+
+
+
+
+
+
+
+
+
+
+# Appointments section
     with st.container(border=True):
         st.subheader("📅 Your Appointments")
         
@@ -583,6 +593,14 @@ def home():
         with summary_cols[2]:
             earnings = hours_worked * hourly_rate
             st.metric("Earnings", f"${earnings:.2f}")
+ 
+
+
+
+
+
+
+
     
 
 
